@@ -121,16 +121,16 @@ class RemoteClient:
 
     def run_ssh(self, cmd: str) -> subprocess.CompletedProcess[str]:
         try:
-            return subprocess.run(["ssh", '-q', self.config.remote_server, shlex.quote(cmd)], check=True, capture_output=True, text=True)
+            return subprocess.run(["ssh", '-q', self.config.remote_server, cmd], check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as e:
             raise LockSyncError(f"SSH command failed.\nCommand: {cmd}\nStdout: {e.stdout}\nStderr: {e.stderr}")
 
     def run_ssh_nocheck(self, cmd: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(["ssh", '-q', self.config.remote_server, shlex.quote(cmd)], capture_output=True, text=True)
+        return subprocess.run(["ssh", '-q', self.config.remote_server, cmd], capture_output=True, text=True)
 
     def write_lock_info(self, local_lock_file: Path) -> None:
         try:
-            subprocess.run(["scp", '-q', str(local_lock_file), self.remote_info_path], check=True, capture_output=True, text=True)
+            subprocess.run(["scp", '-q', f"{local_lock_file}", f"{self.config.remote_server}:{shlex.quote(self.remote_info_path)}"], check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as e:
             raise LockSyncError(f"SCP error when trying to write lock info to {self.remote_info_path}.\nStdout: {e.stdout}\nStderr: {e.stderr}")
 
@@ -139,7 +139,7 @@ class RemoteClient:
         local = f"{self.local_data_path}/"
         remote = f"{self.config.remote_server}:{self.remote_data_path}/"
 
-        cmd = ["rsync", "-avz", "--delete"]
+        cmd = ["rsync", "-avz", "-s", "--delete"]
         if direction == Direction.UP:
             cmd.extend([local, remote])
         else:
@@ -152,15 +152,15 @@ class RemoteClient:
             raise LockSyncError(f"Rsync failed.\nStdout: {e.stdout}\nStderr: {e.stderr}")
 
     def remote_dir_exists(self) -> bool:
-        res = self.run_ssh_nocheck(f"[ -d '{self.config.remote_dir}' ]")
+        res = self.run_ssh_nocheck(f"[ -d {shlex.quote(self.config.remote_dir)} ]")
         return res.returncode == 0
 
     def initialize_remote(self, force: bool) -> None:
         if force:
-            self.run_ssh(f"mkdir -p '{self.config.remote_dir}' '{self.remote_data_path}'")
+            self.run_ssh(f"mkdir -p {shlex.quote(self.config.remote_dir)} {shlex.quote(self.remote_data_path)}")
         else:
             # Without -p, this inherently fails if the directory already exists or parents are missing
-            self.run_ssh(f"mkdir '{self.config.remote_dir}' '{self.remote_data_path}'")
+            self.run_ssh(f"mkdir {shlex.quote(self.config.remote_dir)} {shlex.quote(self.remote_data_path)}")
 
 @dataclass
 class LockContext:
@@ -200,12 +200,12 @@ class LockManager:
             raise LockSyncError(f"Local state indicates lock exists ({current_state}). Use --force to override.")
 
         if force:
-            self.remote.run_ssh_nocheck(f"rm -rf '{self.remote.remote_lock_path}'")
+            self.remote.run_ssh_nocheck(f"rm -rf {shlex.quote(self.remote.remote_lock_path)}")
 
         # Atomic lock via mkdir
-        res = self.remote.run_ssh_nocheck(f"mkdir '{self.remote.remote_lock_path}'")
+        res = self.remote.run_ssh_nocheck(f"mkdir {shlex.quote(self.remote.remote_lock_path)}")
         if res.returncode != 0:
-            info_res = self.remote.run_ssh_nocheck(f"cat '{self.remote.remote_info_path}'")
+            info_res = self.remote.run_ssh_nocheck(f"cat {shlex.quote(self.remote.remote_info_path)}")
             msg = "Remote lock already held!"
             if info_res.returncode == 0:
                 msg += f"\n\n--- Remote Lock Info ---\n{info_res.stdout}\n------------------------"
@@ -221,6 +221,7 @@ class LockManager:
             self.remote.write_lock_info(target_file)
         except LockSyncError:
             self.local_mgr.clear_state_files()
+            self.remote.run_ssh_nocheck(f"rm -rf {shlex.quote(self.remote.remote_lock_path)}")
             raise
 
         return LockContext(self, lock_type)
@@ -248,7 +249,7 @@ class LockManager:
             raise LockSyncError(f"Local state is {current_state}, unexpected for lock type {lock_type}.")
 
         local_info = self.local_mgr.read_state_file(current_state)
-        info_res = self.remote.run_ssh_nocheck(f"cat '{self.remote.remote_info_path}'")
+        info_res = self.remote.run_ssh_nocheck(f"cat {shlex.quote(self.remote.remote_info_path)}")
 
         if info_res.returncode != 0:
             raise LockSyncError("Could not read remote lock info. The remote lock may have been broken by another user.")
@@ -264,7 +265,7 @@ class LockManager:
     def release(self, lock_type: LockType) -> None:
         try:
             self.verify_lock(lock_type)
-            self.remote.run_ssh_nocheck(f"rm -rf '{self.remote.remote_lock_path}'")
+            self.remote.run_ssh_nocheck(f"rm -rf {shlex.quote(self.remote.remote_lock_path)}")
         except LockSyncError as e:
             print(f"\n[Warning] {e} Leaving remote lock intact.", file=sys.stderr)
 
@@ -345,7 +346,7 @@ def cmd_lock(args: argparse.Namespace) -> None:
 
     try:
         remote.run_rsync(Direction.DOWN)
-    except Exception:
+    except BaseException:
         # If rsync fails during lock acquisition, halt in an intermediate state
         lock_mgr.release(LockType.RO)
         raise
