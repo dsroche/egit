@@ -10,7 +10,8 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Dict
-
+from dataclasses import dataclass
+import shlex
 
 class LockType(StrEnum):
     RO = "read-only"
@@ -88,10 +89,12 @@ class LocalFolderManager:
                 raise LockSyncError(f"State file {state} contains invalid format.")
             return data
 
-    def write_state_file(self, state: LocalState, info: Dict[str, Any]) -> None:
+    def write_state_file(self, state: LocalState, info: Dict[str, Any]) -> Path:
         self.clear_state_files()
-        with (self.local_path / state).open("w") as f:
+        dest = self.local_path / state
+        with dest.open("w") as f:
             json.dump(info, f, indent=4)
+        return dest
 
     def clear_state_files(self) -> None:
         (self.local_path / LocalState.LOCKED).unlink(missing_ok=True)
@@ -100,7 +103,7 @@ class LocalFolderManager:
     def set_permissions(self, writable: bool) -> None:
         if not self.data_path.exists():
             raise LockSyncError(f"Local data path {self.data_path} does not exist.")
-        
+
         mode = "u+w" if writable else "a-w"
         try:
             subprocess.run(["chmod", "-R", mode, str(self.data_path)], check=True, capture_output=True, text=True)
@@ -118,12 +121,18 @@ class RemoteClient:
 
     def run_ssh(self, cmd: str) -> subprocess.CompletedProcess[str]:
         try:
-            return subprocess.run(["ssh", self.config.remote_server, cmd], check=True, capture_output=True, text=True)
+            return subprocess.run(["ssh", '-q', self.config.remote_server, shlex.quote(cmd)], check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as e:
             raise LockSyncError(f"SSH command failed.\nCommand: {cmd}\nStdout: {e.stdout}\nStderr: {e.stderr}")
 
     def run_ssh_nocheck(self, cmd: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(["ssh", self.config.remote_server, cmd], capture_output=True, text=True)
+        return subprocess.run(["ssh", '-q', self.config.remote_server, shlex.quote(cmd)], capture_output=True, text=True)
+
+    def write_lock_info(self, local_lock_file: Path) -> None:
+        try:
+            subprocess.run(["scp", '-q', str(local_lock_file), self.remote_info_path], check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            raise LockSyncError(f"SCP error when trying to write lock info to {self.remote_info_path}.\nStdout: {e.stdout}\nStderr: {e.stderr}")
 
     def run_rsync(self, direction: Direction) -> None:
         # Trailing slashes are critical in rsync to sync directory contents rather than the directory itself.
@@ -153,6 +162,16 @@ class RemoteClient:
             # Without -p, this inherently fails if the directory already exists or parents are missing
             self.run_ssh(f"mkdir '{self.config.remote_dir}' '{self.remote_data_path}'")
 
+@dataclass
+class LockContext:
+    manager: 'LockManager'
+    lock_type: LockType
+
+    def __enter__(self) -> None:
+        pass
+
+    def __exit__(self, *args: Any) -> None:
+        self.manager.release(self.lock_type)
 
 class LockManager:
     def __init__(self, local_mgr: LocalFolderManager, remote_client: RemoteClient) -> None:
@@ -175,7 +194,7 @@ class LockManager:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-    def acquire(self, lock_type: LockType, force: bool = False) -> None:
+    def acquire(self, lock_type: LockType, force: bool = False) -> LockContext:
         current_state = self.local_mgr.get_current_state()
         if current_state != LocalState.NONE and not force:
             raise LockSyncError(f"Local state indicates lock exists ({current_state}). Use --force to override.")
@@ -195,28 +214,42 @@ class LockManager:
             raise LockSyncError(msg)
 
         info = self._generate_info(lock_type)
-        safe_info_str = json.dumps(info).replace("'", "'\\''")
-        self.remote.run_ssh(f"echo '{safe_info_str}' > '{self.remote.remote_info_path}'")
-        self.local_mgr.write_state_file(LocalState.SYNCING, info)
+        target_state = LocalState.LOCKED if lock_type == LockType.RW else LocalState.SYNCING
+        target_file = self.local_mgr.write_state_file(target_state, info)
+
+        try:
+            self.remote.write_lock_info(target_file)
+        except LockSyncError:
+            self.local_mgr.clear_state_files()
+            raise
+
+        return LockContext(self, lock_type)
 
     def upgrade(self) -> None:
+        self.verify_lock(LockType.RO)
+
         info = self._generate_info(LockType.RW)
-        safe_info_str = json.dumps(info).replace("'", "'\\''")
-        self.remote.run_ssh(f"echo '{safe_info_str}' > '{self.remote.remote_info_path}'")
-        self.local_mgr.write_state_file(LocalState.LOCKED, info)
+        target_file = self.local_mgr.write_state_file(LocalState.LOCKED, info)
 
-    def release(self) -> None:
-        self.remote.run_ssh_nocheck(f"rm -rf '{self.remote.remote_lock_path}'")
-        self.local_mgr.set_permissions(writable=False)
-        self.local_mgr.clear_state_files()
+        try:
+            self.remote.write_lock_info(target_file)
+        except LockSyncError:
+            self.local_mgr.clear_state_files()
+            raise
 
-    def verify_lock(self) -> None:
-        if self.local_mgr.get_current_state() != LocalState.LOCKED:
-            raise LockSyncError("Local state is not LOCKED. Cannot perform 'up'.")
+    def verify_lock(self, lock_type: LockType) -> None:
+        current_state = self.local_mgr.get_current_state()
 
-        local_info = self.local_mgr.read_state_file(LocalState.LOCKED)
+        if lock_type == LockType.RW and current_state == LocalState.LOCKED:
+            pass
+        elif lock_type == LockType.RO and current_state == LocalState.SYNCING:
+            pass
+        else:
+            raise LockSyncError(f"Local state is {current_state}, unexpected for lock type {lock_type}.")
+
+        local_info = self.local_mgr.read_state_file(current_state)
         info_res = self.remote.run_ssh_nocheck(f"cat '{self.remote.remote_info_path}'")
-        
+
         if info_res.returncode != 0:
             raise LockSyncError("Could not read remote lock info. The remote lock may have been broken by another user.")
 
@@ -226,7 +259,19 @@ class LockManager:
             raise LockSyncError("Remote info.txt is corrupt or invalid JSON.")
 
         if local_info != remote_info:
-            raise LockSyncError("Remote lock info does not match local LOCKED info. Lock was likely broken and re-acquired by another user.")
+            raise LockSyncError("Remote lock info does not match local info. Lock was likely broken and re-acquired by another user.")
+
+    def release(self, lock_type: LockType) -> None:
+        try:
+            self.verify_lock(lock_type)
+            self.remote.run_ssh_nocheck(f"rm -rf '{self.remote.remote_lock_path}'")
+        except LockSyncError as e:
+            print(f"\n[Warning] {e} Leaving remote lock intact.", file=sys.stderr)
+
+        # Always enforce local read-only state and clear local lock files,
+        # even if the remote lock was lost, to ensure local integrity.
+        self.local_mgr.set_permissions(writable=False)
+        self.local_mgr.clear_state_files()
 
 
 # --- CLI Commands ---
@@ -264,12 +309,10 @@ def cmd_join(args: argparse.Namespace) -> None:
     lock_mgr = LockManager(local_mgr, remote)
 
     print("Fetching initial data...")
-    lock_mgr.acquire(LockType.RO, args.force)
-    local_mgr.set_permissions(writable=True)
-    try:
+    with lock_mgr.acquire(LockType.RO, args.force):
+        local_mgr.set_permissions(writable=True)
         remote.run_rsync(Direction.DOWN)
-    finally:
-        lock_mgr.release()
+
     print("Successfully joined and downloaded sync folder.")
 
 
@@ -282,12 +325,9 @@ def cmd_down(args: argparse.Namespace) -> None:
     remote = RemoteClient(conf, local_mgr.data_path)
     lock_mgr = LockManager(local_mgr, remote)
 
-    lock_mgr.acquire(LockType.RO, args.force)
-    local_mgr.set_permissions(writable=True)
-    try:
+    with lock_mgr.acquire(LockType.RO, args.force):
+        local_mgr.set_permissions(writable=True)
         remote.run_rsync(Direction.DOWN)
-    finally:
-        lock_mgr.release()
     print("Successfully downloaded latest data.")
 
 
@@ -306,8 +346,8 @@ def cmd_lock(args: argparse.Namespace) -> None:
     try:
         remote.run_rsync(Direction.DOWN)
     except Exception:
-        # If rsync fails during lock acquisition, revert completely.
-        lock_mgr.release()
+        # If rsync fails during lock acquisition, halt in an intermediate state
+        lock_mgr.release(LockType.RO)
         raise
 
     lock_mgr.upgrade()
@@ -323,11 +363,11 @@ def cmd_up(args: argparse.Namespace) -> None:
     remote = RemoteClient(conf, local_mgr.data_path)
     lock_mgr = LockManager(local_mgr, remote)
 
-    lock_mgr.verify_lock()
+    lock_mgr.verify_lock(LockType.RW)
     remote.run_rsync(Direction.UP)
-    
+
     # We only release if rsync succeeds. If it fails, they still own the lock and can retry.
-    lock_mgr.release()
+    lock_mgr.release(LockType.RW)
     print("Successfully uploaded changes and released lock.")
 
 
