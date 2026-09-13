@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import argparse
-import dataclasses
 import json
 import socket
 import subprocess
@@ -10,7 +9,7 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Dict
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 import shlex
 
 class LockType(StrEnum):
@@ -34,13 +33,15 @@ class LockSyncError(Exception):
     pass
 
 
-@dataclasses.dataclass
+@dataclass
 class Config:
     remote_server: str
     remote_dir: str
 
 
 class ConfigManager:
+    CONFIG_FNAME: str = 'locksync.json'
+
     def __init__(self, local_path: Path) -> None:
         self.config_path = local_path / "locksync.json"
 
@@ -56,8 +57,18 @@ class ConfigManager:
             raise LockSyncError(f"Config already exists at {self.config_path}. Use --force to overwrite.")
         conf = Config(remote_server=server, remote_dir=remote_dir)
         with self.config_path.open("w") as f:
-            json.dump(dataclasses.asdict(conf), f, indent=4)
+            json.dump(asdict(conf), f, indent=4)
         return conf
+
+def guess_local_folder() -> Path:
+    """Tries to auto-determine the local_folder based on locksync.json location."""
+    cwd = Path.cwd()
+    parents = [cwd]
+    parents.extend(cwd.parents)
+    for p in parents:
+        if (p / ConfigManager.CONFIG_FNAME).exists():
+            return p
+    raise LockSyncError("could not find any locksync path in the parents of current directory.")
 
 
 class LocalFolderManager:
@@ -378,7 +389,7 @@ def main() -> None:
 
     # Base parser for common arguments
     parent_parser = argparse.ArgumentParser(add_help=False)
-    parent_parser.add_argument("local_folder", help="Path to local synchronization folder")
+    parent_parser.add_argument("local_folder", nargs='?', default=None, help="Path to local synchronization folder")
     parent_parser.add_argument("-f", "--force", action="store_true", help="Force operation / break locks")
 
     # Command: create
@@ -401,6 +412,8 @@ def main() -> None:
     subparsers.add_parser("up", parents=[parent_parser], help="Upload local changes to remote and release lock")
 
     args = parser.parse_args()
+    if args.local_folder is None:
+        args.local_folder = guess_local_folder()
 
     try:
         if args.command == "create":
