@@ -5,12 +5,15 @@ import json
 import socket
 import subprocess
 import sys
+import shlex
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Self
 from dataclasses import dataclass, asdict
-import shlex
+from functools import cached_property
+
+CONFIG_FILE_NAME = 'locksync.json'
 
 class LockType(StrEnum):
     RO = "read-only"
@@ -33,12 +36,10 @@ class LockSyncError(Exception):
     pass
 
 
-
 @dataclass
 class Config:
     remote_server: str
     remote_dir: str
-
 
 
 class ConfigManager:
@@ -92,7 +93,7 @@ class LocalFolderManager:
             return LocalState.SYNCING
         return LocalState.NONE
 
-    def read_state_file(self, state: LocalState) -> Dict[str, Any]:
+    def read_state_file(self, state: LocalState) -> dict[str, Any]:
         path = self.local_path / state
         if not path.exists():
             raise LockSyncError(f"State file {state} not found.")
@@ -102,7 +103,7 @@ class LocalFolderManager:
                 raise LockSyncError(f"State file {state} contains invalid format.")
             return data
 
-    def write_state_file(self, state: LocalState, info: Dict[str, Any]) -> Path:
+    def write_state_file(self, state: LocalState, info: dict[str, Any]) -> Path:
         self.clear_state_files()
         dest = self.local_path / state
         with dest.open("w") as f:
@@ -170,7 +171,7 @@ class RemoteClient:
 
     def initialize_remote(self, force: bool) -> None:
         if force:
-            self.run_ssh(f"mkdir -p {shlex.quote(self.config.remote_dir)} {shlex.quote(self.remote_data_path)}")
+            self.run_ssh(f"p {shlex.quote(self.config.remote_dir)} {shlex.quote(self.remote_data_path)}")
         else:
             # Without -p, this inherently fails if the directory already exists or parents are missing
             self.run_ssh(f"mkdir {shlex.quote(self.config.remote_dir)} {shlex.quote(self.remote_data_path)}")
@@ -199,7 +200,7 @@ class LockManager:
             return parts[0]
         return "unknown"
 
-    def _generate_info(self, lock_type: LockType) -> Dict[str, Any]:
+    def _generate_info(self, lock_type: LockType) -> dict[str, Any]:
         return {
             "lock_type": lock_type,
             "hostname": socket.gethostname(),
@@ -288,101 +289,120 @@ class LockManager:
         self.local_mgr.clear_state_files()
 
 
+# --- Orchestrator class ---
+
+@dataclass
+class LockSync:
+    local_dir: Path
+    remote_server: str
+    remote_dir: str
+    force: bool = False
+
+    # TODO refactor and remove this
+    @cached_property
+    def config(self) -> Config:
+        return Config(remote_server = self.remote_server, remote_dir = self.remote_dir)
+
+    @cached_property
+    def local_mgr(self) -> LocalFolderManager:
+        return LocalFolderManager(self.local_dir)
+
+    @cached_property
+    def remote(self) -> RemoteClient:
+        return RemoteClient(self.config, self.local_mgr.data_path)
+
+    @cached_property
+    def lock_mgr(self) -> LockManager:
+        return LockManager(self.local_mgr, self.remote)
+
+    @classmethod
+    def from_config_json(cls, config_data: dict[str, Any], parent_loc: Path|None = None) -> Self:
+        try:
+            local_dir = config_data.get('local_dir', '')
+            remote_server = config_data['remote_server']
+            remote_dir = config_data['remote_dir']
+        except KeyError as kerr:
+            raise LockSyncError(f"config data missing key '{kerr.args[0]}'") from None
+        ldir = Path(local_dir).expanduser()
+        if not ldir.is_absolute():
+            if parent_loc is None:
+                raise LockSyncError("local_dir in config is relative path but parent_loc is not given")
+            ldir = parent_loc / ldir
+        return cls(local_dir = ldir,
+                   remote_server = remote_server,
+                   remote_dir = remote_dir,
+                   )
+
+    @classmethod
+    def from_config_file(cls, config_loc: Path) -> Self:
+        dic = json.load(config_loc.open('r'))
+        parent_loc = config_loc.absolute().parent
+        return cls.from_config_json(dic, parent_loc)
+
+    def save_config_file(self, config_loc: Path|None = None) -> None:
+        if config_loc is None:
+            config_loc = self.local_dir / CONFIG_FILE_NAME
+        if not self.force and config_loc.exists():
+            raise LockSyncError(f"Config already exists at {config_loc}. Use --force to overwrite.")
+        with config_loc.open('w') as f:
+            json.dump(asdict(self.config), f, indent=4)
+
+    def create(self) -> None:
+        self.local_mgr.initialize(self.force)
+
+        if self.remote.remote_dir_exists() and not self.force:
+            raise LockSyncError(f"Remote directory {self.remote_dir} already exists. Use --force to override.")
+
+        self.remote.initialize_remote(self.force)
+        self.local_mgr.set_permissions(writable=False)
+        print("Successfully created remote sync folder and local configuration.")
+
+    def add(self) -> None:
+        self.local_mgr.initialize(self.force)
+
+        if not self.remote.remote_dir_exists():
+            raise LockSyncError(f"Remote directory {self.remote_dir} does not exist.")
+
+        self.local_mgr.set_permissions(writable=False)
+
+        print("Fetching initial data...")
+        with self.lock_mgr.acquire(LockType.RO, self.force):
+            self.local_mgr.set_permissions(writable=True)
+            self.remote.run_rsync(Direction.DOWN)
+
+        print("Successfully added and downloaded sync folder.")
+
+    def sync(self) -> None:
+        with self.lock_mgr.acquire(LockType.RO, self.force):
+            self.local_mgr.set_permissions(writable=True)
+            self.remote.run_rsync(Direction.DOWN)
+        print("Successfully downloaded latest data.")
+
+    def edit(self) -> None:
+        self.lock_mgr.acquire(LockType.RO, self.force)
+        self.local_mgr.set_permissions(writable=True)
+
+        try:
+            self.remote.run_rsync(Direction.DOWN)
+        except BaseException:
+            # If rsync fails during lock acquisition, halt in an intermediate state
+            self.lock_mgr.release(LockType.RO)
+            raise
+
+        self.lock_mgr.upgrade()
+        print("Successfully locked for editing. You may now modify files in data/.")
+
+    def save(self) -> None:
+        self.lock_mgr.verify_lock(LockType.RW)
+        self.remote.run_rsync(Direction.UP)
+
+        # We only release if rsync succeeds. If it fails, they still own the lock and can retry.
+        self.lock_mgr.release(LockType.RW)
+        print("Successfully uploaded changes and released lock.")
+
+
+
 # --- CLI Commands ---
-
-def cmd_create(args: argparse.Namespace) -> None:
-    local_path = Path(args.local_folder).resolve()
-    conf_mgr = ConfigManager(local_path)
-    local_mgr = LocalFolderManager(local_path)
-
-    local_mgr.initialize(args.force)
-    conf = conf_mgr.create(args.remote_server, args.remote_dir, args.force)
-    remote = RemoteClient(conf, local_mgr.data_path)
-
-    if remote.remote_dir_exists() and not args.force:
-        raise LockSyncError(f"Remote directory {args.remote_dir} already exists. Use --force to override.")
-
-    remote.initialize_remote(args.force)
-    local_mgr.set_permissions(writable=False)
-    print("Successfully created remote sync folder and local configuration.")
-
-
-def cmd_add(args: argparse.Namespace) -> None:
-    local_path = Path(args.local_folder).resolve()
-    conf_mgr = ConfigManager(local_path)
-    local_mgr = LocalFolderManager(local_path)
-
-    local_mgr.initialize(args.force)
-    conf = conf_mgr.create(args.remote_server, args.remote_dir, args.force)
-    remote = RemoteClient(conf, local_mgr.data_path)
-
-    if not remote.remote_dir_exists():
-        raise LockSyncError(f"Remote directory {args.remote_dir} does not exist.")
-
-    local_mgr.set_permissions(writable=False)
-    lock_mgr = LockManager(local_mgr, remote)
-
-    print("Fetching initial data...")
-    with lock_mgr.acquire(LockType.RO, args.force):
-        local_mgr.set_permissions(writable=True)
-        remote.run_rsync(Direction.DOWN)
-
-    print("Successfully added and downloaded sync folder.")
-
-
-def cmd_sync(args: argparse.Namespace) -> None:
-    local_path = Path(args.local_folder).resolve()
-    conf_mgr = ConfigManager(local_path)
-    conf = conf_mgr.load()
-
-    local_mgr = LocalFolderManager(local_path)
-    remote = RemoteClient(conf, local_mgr.data_path)
-    lock_mgr = LockManager(local_mgr, remote)
-
-    with lock_mgr.acquire(LockType.RO, args.force):
-        local_mgr.set_permissions(writable=True)
-        remote.run_rsync(Direction.DOWN)
-    print("Successfully downloaded latest data.")
-
-
-def cmd_edit(args: argparse.Namespace) -> None:
-    local_path = Path(args.local_folder).resolve()
-    conf_mgr = ConfigManager(local_path)
-    conf = conf_mgr.load()
-
-    local_mgr = LocalFolderManager(local_path)
-    remote = RemoteClient(conf, local_mgr.data_path)
-    lock_mgr = LockManager(local_mgr, remote)
-
-    lock_mgr.acquire(LockType.RO, args.force)
-    local_mgr.set_permissions(writable=True)
-
-    try:
-        remote.run_rsync(Direction.DOWN)
-    except BaseException:
-        # If rsync fails during lock acquisition, halt in an intermediate state
-        lock_mgr.release(LockType.RO)
-        raise
-
-    lock_mgr.upgrade()
-    print("Successfully locked for editing. You may now modify files in data/.")
-
-
-def cmd_save(args: argparse.Namespace) -> None:
-    local_path = Path(args.local_folder).resolve()
-    conf_mgr = ConfigManager(local_path)
-    conf = conf_mgr.load()
-
-    local_mgr = LocalFolderManager(local_path)
-    remote = RemoteClient(conf, local_mgr.data_path)
-    lock_mgr = LockManager(local_mgr, remote)
-
-    lock_mgr.verify_lock(LockType.RW)
-    remote.run_rsync(Direction.UP)
-
-    # We only release if rsync succeeds. If it fails, they still own the lock and can retry.
-    lock_mgr.release(LockType.RW)
-    print("Successfully uploaded changes and released lock.")
 
 
 def main() -> None:
@@ -391,48 +411,61 @@ def main() -> None:
 
     # Base parser for common arguments
     parent_parser = argparse.ArgumentParser(add_help=False)
+    parent_parser.add_argument("local_folder", type=Path, nargs='?', default=None, help="Path to local synchronization folder")
+    parent_parser.add_argument("remote_server", nargs='?', default=None, help="SSH remote server (e.g. user@host)")
+    parent_parser.add_argument("remote_dir", nargs='?', default=None, help="Path to remote synchronization directory")
     parent_parser.add_argument("-f", "--force", action="store_true", help="Force operation / break locks")
+    parent_parser.add_argument("-n", "--no-config", action="store_true", help="Do not read/write config file")
 
-    # Parser for commands where the folder should already exist
-    exist_parser = argparse.ArgumentParser(parents=[parent_parser], add_help=False)
-    exist_parser.add_argument("local_folder", nargs='?', default=None, help="Path to local synchronization folder")
-
-    # Command: create
-    parser_create = subparsers.add_parser("create", parents=[parent_parser], help="Create a new sync folder on remote")
-    parser_create.add_argument("local_folder", help="Path to local synchronization folder")
-    parser_create.add_argument("remote_server", help="SSH remote server (e.g. user@host)")
-    parser_create.add_argument("remote_dir", help="Path to remote synchronization directory")
-
-    # Command: add
-    parser_add = subparsers.add_parser("add", parents=[parent_parser], help="add an existing remote sync folder")
-    parser_add.add_argument("local_folder", help="Path to local synchronization folder")
-    parser_add.add_argument("remote_server", help="SSH remote server (e.g. user@host)")
-    parser_add.add_argument("remote_dir", help="Path to remote synchronization directory")
-
-    # Command: sync
-    subparsers.add_parser("sync", parents=[exist_parser], help="Sync remote changes locally without locking")
-
-    # Command: edit
-    subparsers.add_parser("edit", parents=[exist_parser], help="Sync locally and acquire read-write lock")
-
-    # Command: save
-    subparsers.add_parser("save", parents=[exist_parser], help="Upload local changes to remote and release lock")
+    subparsers.add_parser("create", parents=[parent_parser], help="Create a new sync folder on remote")
+    subparsers.add_parser("add", parents=[parent_parser], help="add an existing remote sync folder")
+    subparsers.add_parser("sync", parents=[parent_parser], help="Sync remote changes locally without locking")
+    subparsers.add_parser("edit", parents=[parent_parser], help="Sync locally and acquire read-write lock")
+    subparsers.add_parser("save", parents=[parent_parser], help="Upload local changes to remote and release lock")
 
     args = parser.parse_args()
-    if args.local_folder is None:
-        args.local_folder = guess_local_folder()
+
+    if args.remote_dir is not None:
+        # got all command-line args
+        orch = LockSync(local_dir = args.local_folder,
+                        remote_server = args.remote_server,
+                        remote_dir = args.remote_dir)
+    elif args.no_config:
+        print("ERROR: need all command-line args when running with --no-config", file=sys.stdout)
+        sys.exit(1)
+    elif args.command in {'create', 'add'}:
+        print("ERROR: need all command-line args when creating or adding", file=sys.stdout)
+        sys.exit(1)
+    else:
+        if args.local_folder is None:
+            args.local_folder = guess_local_folder()
+        cfile = args.local_folder / CONFIG_FILE_NAME
+        if cfile.exists():
+            orch = LockSync.from_config_file(cfile)
+        else:
+            print(f"ERROR: no config file found at cfile", file=sys.stdout)
+            sys.exit(1)
+
+    orch.force = args.force
 
     try:
-        if args.command == "create":
-            cmd_create(args)
-        elif args.command == "add":
-            cmd_add(args)
-        elif args.command == "sync":
-            cmd_sync(args)
-        elif args.command == "edit":
-            cmd_edit(args)
-        elif args.command == "save":
-            cmd_save(args)
+        match args.command:
+            case 'create':
+                orch.create()
+                if not args.no_config:
+                    orch.save_config_file()
+            case 'add':
+                orch.add()
+                if not args.no_config:
+                    orch.save_config_file()
+            case 'sync':
+                orch.sync()
+            case 'edit':
+                orch.edit()
+            case 'save':
+                orch.save()
+            case _:
+                assert False, "should be unreachable"
     except LockSyncError as e:
         print(f"\n[Error] {e}", file=sys.stderr)
         sys.exit(1)

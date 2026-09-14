@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+shopt -s nullglob
+
+srcdir=$(dirname "$(readlink -f "$0")")
+
+while [[ ${1:0:1} == '-' ]]; do
+  [[ $1 == '-q' ]] || echo "IGNORING SCP ARG $1..." >>"$srcdir/../temp/SSH_LOG.txt"
+  shift
+done
+
+if [[ $# -ne 2 ]]; then
+  echo "ERROR: wrong number of args for scp" >&2
+  exit 1
+fi
+
+[[ $1 == *:* ]] && src="$srcdir/../temp/${1%%:*}/${1#*:}" || src="$1"
+[[ $2 == *:* ]] && dest="$srcdir/../temp/${2%%:*}/${2#*:}" || dest="$2"
+
+echo "ABOUT TO COPY VIA SCP '$src' -> '$dest'" >>"$srcdir/../temp/SSH_LOG.txt"
+
+cp "$src" "$dest"

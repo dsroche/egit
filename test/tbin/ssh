@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+shopt -s nullglob
+
+srcdir=$(dirname "$(readlink -f "$0")")
+
+cd "$srcdir/../temp"
+
+while [[ ${1:0:1} == '-' ]]; do
+  [[ $1 == '-q' ]] || echo "IGNORING SSH ARG $1..." >>"$srcdir/../temp/SSH_LOG.txt"
+  shift
+done
+
+mkdir -p "$1"
+cd "$1"
+
+shift
+echo "ABOUT TO EXECUTE SSH CMD $@" >>"$srcdir/../temp/SSH_LOG.txt"
+
+export SSH_CLIENT="my.external.ip"
+exec $@
