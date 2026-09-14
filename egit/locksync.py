@@ -42,34 +42,13 @@ class Config:
     remote_dir: str
 
 
-class ConfigManager:
-    CONFIG_FNAME: str = 'locksync.json'
-
-    def __init__(self, local_path: Path) -> None:
-        self.config_path = local_path / "locksync.json"
-
-    def load(self) -> Config:
-        if not self.config_path.exists():
-            raise LockSyncError(f"Config not found at {self.config_path}. Run 'create' or 'add' first.")
-        with self.config_path.open("r") as f:
-            data = json.load(f)
-        return Config(remote_server=data["remote_server"], remote_dir=data["remote_dir"])
-
-    def create(self, server: str, remote_dir: str, force: bool) -> Config:
-        if self.config_path.exists() and not force:
-            raise LockSyncError(f"Config already exists at {self.config_path}. Use --force to overwrite.")
-        conf = Config(remote_server=server, remote_dir=remote_dir)
-        with self.config_path.open("w") as f:
-            json.dump(asdict(conf), f, indent=4)
-        return conf
-
 def guess_local_folder() -> Path:
     """Tries to auto-determine the local_folder based on locksync.json location."""
     cwd = Path.cwd()
     parents = [cwd]
     parents.extend(cwd.parents)
     for p in parents:
-        if (p / ConfigManager.CONFIG_FNAME).exists():
+        if (p / CONFIG_FILE_NAME).exists():
             return p
     raise LockSyncError("could not find any locksync path in the parents of current directory.")
 
