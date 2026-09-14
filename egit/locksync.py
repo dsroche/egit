@@ -24,7 +24,7 @@ class Direction(StrEnum):
 
 class LocalState(StrEnum):
     SYNCING = "SYNCING"
-    LOCKED = "LOCKED"
+    EDITING = "EDITING"
     NONE = "NONE"
 
 
@@ -33,10 +33,12 @@ class LockSyncError(Exception):
     pass
 
 
+
 @dataclass
 class Config:
     remote_server: str
     remote_dir: str
+
 
 
 class ConfigManager:
@@ -47,7 +49,7 @@ class ConfigManager:
 
     def load(self) -> Config:
         if not self.config_path.exists():
-            raise LockSyncError(f"Config not found at {self.config_path}. Run 'create' or 'join' first.")
+            raise LockSyncError(f"Config not found at {self.config_path}. Run 'create' or 'add' first.")
         with self.config_path.open("r") as f:
             data = json.load(f)
         return Config(remote_server=data["remote_server"], remote_dir=data["remote_dir"])
@@ -84,8 +86,8 @@ class LocalFolderManager:
             raise LockSyncError(f"Path already exists: {e.filename}. Use --force to override.")
 
     def get_current_state(self) -> LocalState:
-        if (self.local_path / LocalState.LOCKED).exists():
-            return LocalState.LOCKED
+        if (self.local_path / LocalState.EDITING).exists():
+            return LocalState.EDITING
         if (self.local_path / LocalState.SYNCING).exists():
             return LocalState.SYNCING
         return LocalState.NONE
@@ -108,7 +110,7 @@ class LocalFolderManager:
         return dest
 
     def clear_state_files(self) -> None:
-        (self.local_path / LocalState.LOCKED).unlink(missing_ok=True)
+        (self.local_path / LocalState.EDITING).unlink(missing_ok=True)
         (self.local_path / LocalState.SYNCING).unlink(missing_ok=True)
 
     def set_permissions(self, writable: bool) -> None:
@@ -225,7 +227,7 @@ class LockManager:
             raise LockSyncError(msg)
 
         info = self._generate_info(lock_type)
-        target_state = LocalState.LOCKED if lock_type == LockType.RW else LocalState.SYNCING
+        target_state = LocalState.EDITING if lock_type == LockType.RW else LocalState.SYNCING
         target_file = self.local_mgr.write_state_file(target_state, info)
 
         try:
@@ -241,7 +243,7 @@ class LockManager:
         self.verify_lock(LockType.RO)
 
         info = self._generate_info(LockType.RW)
-        target_file = self.local_mgr.write_state_file(LocalState.LOCKED, info)
+        target_file = self.local_mgr.write_state_file(LocalState.EDITING, info)
 
         try:
             self.remote.write_lock_info(target_file)
@@ -252,7 +254,7 @@ class LockManager:
     def verify_lock(self, lock_type: LockType) -> None:
         current_state = self.local_mgr.get_current_state()
 
-        if lock_type == LockType.RW and current_state == LocalState.LOCKED:
+        if lock_type == LockType.RW and current_state == LocalState.EDITING:
             pass
         elif lock_type == LockType.RO and current_state == LocalState.SYNCING:
             pass
@@ -305,7 +307,7 @@ def cmd_create(args: argparse.Namespace) -> None:
     print("Successfully created remote sync folder and local configuration.")
 
 
-def cmd_join(args: argparse.Namespace) -> None:
+def cmd_add(args: argparse.Namespace) -> None:
     local_path = Path(args.local_folder).resolve()
     conf_mgr = ConfigManager(local_path)
     local_mgr = LocalFolderManager(local_path)
@@ -325,10 +327,10 @@ def cmd_join(args: argparse.Namespace) -> None:
         local_mgr.set_permissions(writable=True)
         remote.run_rsync(Direction.DOWN)
 
-    print("Successfully joined and downloaded sync folder.")
+    print("Successfully added and downloaded sync folder.")
 
 
-def cmd_down(args: argparse.Namespace) -> None:
+def cmd_sync(args: argparse.Namespace) -> None:
     local_path = Path(args.local_folder).resolve()
     conf_mgr = ConfigManager(local_path)
     conf = conf_mgr.load()
@@ -343,7 +345,7 @@ def cmd_down(args: argparse.Namespace) -> None:
     print("Successfully downloaded latest data.")
 
 
-def cmd_lock(args: argparse.Namespace) -> None:
+def cmd_edit(args: argparse.Namespace) -> None:
     local_path = Path(args.local_folder).resolve()
     conf_mgr = ConfigManager(local_path)
     conf = conf_mgr.load()
@@ -366,7 +368,7 @@ def cmd_lock(args: argparse.Namespace) -> None:
     print("Successfully locked for editing. You may now modify files in data/.")
 
 
-def cmd_up(args: argparse.Namespace) -> None:
+def cmd_save(args: argparse.Namespace) -> None:
     local_path = Path(args.local_folder).resolve()
     conf_mgr = ConfigManager(local_path)
     conf = conf_mgr.load()
@@ -389,27 +391,32 @@ def main() -> None:
 
     # Base parser for common arguments
     parent_parser = argparse.ArgumentParser(add_help=False)
-    parent_parser.add_argument("local_folder", nargs='?', default=None, help="Path to local synchronization folder")
     parent_parser.add_argument("-f", "--force", action="store_true", help="Force operation / break locks")
+
+    # Parser for commands where the folder should already exist
+    exist_parser = argparse.ArgumentParser(parents=[parent_parser], add_help=False)
+    exist_parser.add_argument("local_folder", nargs='?', default=None, help="Path to local synchronization folder")
 
     # Command: create
     parser_create = subparsers.add_parser("create", parents=[parent_parser], help="Create a new sync folder on remote")
+    parser_create.add_argument("local_folder", help="Path to local synchronization folder")
     parser_create.add_argument("remote_server", help="SSH remote server (e.g. user@host)")
     parser_create.add_argument("remote_dir", help="Path to remote synchronization directory")
 
-    # Command: join
-    parser_join = subparsers.add_parser("join", parents=[parent_parser], help="Join an existing remote sync folder")
-    parser_join.add_argument("remote_server", help="SSH remote server (e.g. user@host)")
-    parser_join.add_argument("remote_dir", help="Path to remote synchronization directory")
+    # Command: add
+    parser_add = subparsers.add_parser("add", parents=[parent_parser], help="add an existing remote sync folder")
+    parser_add.add_argument("local_folder", help="Path to local synchronization folder")
+    parser_add.add_argument("remote_server", help="SSH remote server (e.g. user@host)")
+    parser_add.add_argument("remote_dir", help="Path to remote synchronization directory")
 
-    # Command: down
-    subparsers.add_parser("down", parents=[parent_parser], help="Sync remote changes locally without locking")
+    # Command: sync
+    subparsers.add_parser("sync", parents=[exist_parser], help="Sync remote changes locally without locking")
 
-    # Command: lock
-    subparsers.add_parser("lock", parents=[parent_parser], help="Sync locally and acquire read-write lock")
+    # Command: edit
+    subparsers.add_parser("edit", parents=[exist_parser], help="Sync locally and acquire read-write lock")
 
-    # Command: up
-    subparsers.add_parser("up", parents=[parent_parser], help="Upload local changes to remote and release lock")
+    # Command: save
+    subparsers.add_parser("save", parents=[exist_parser], help="Upload local changes to remote and release lock")
 
     args = parser.parse_args()
     if args.local_folder is None:
@@ -418,14 +425,14 @@ def main() -> None:
     try:
         if args.command == "create":
             cmd_create(args)
-        elif args.command == "join":
-            cmd_join(args)
-        elif args.command == "down":
-            cmd_down(args)
-        elif args.command == "lock":
-            cmd_lock(args)
-        elif args.command == "up":
-            cmd_up(args)
+        elif args.command == "add":
+            cmd_add(args)
+        elif args.command == "sync":
+            cmd_sync(args)
+        elif args.command == "edit":
+            cmd_edit(args)
+        elif args.command == "save":
+            cmd_save(args)
     except LockSyncError as e:
         print(f"\n[Error] {e}", file=sys.stderr)
         sys.exit(1)
