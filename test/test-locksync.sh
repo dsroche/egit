@@ -33,6 +33,19 @@ echo "contents" >"$thome/plain/data/f0"
 python3 -m egit.locksync save "$thome/plain"
 python3 -m egit.locksync add "$thome/copy" servername remfold
 diff -s "$thome/plain/data/f0" "$thome/copy/data/f0"
+python3 -m egit.locksync edit "$thome/copy"
+echo "vvvvvvvvvv should give an error vvvvvvvvvvvvvvvv"
+if python3 -m egit.locksync sync "$thome/plain"; then
+  echo "ERROR: should have been an error but wasn't!"
+  exit 1
+fi
+mkdir -p "$thome/copy/data/fold/er"
+python3 -m egit.locksync save "$thome/copy"
+python3 -m egit.locksync sync "$thome/plain"
+if [[ ! -d "$thome/plain/data/fold/er" ]] ; then
+  echo "directory test failed"
+  exit 1
+fi
 
 echo "TEST PASSED"
 #tree test/temp
